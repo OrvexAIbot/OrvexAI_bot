@@ -12,6 +12,17 @@ dist
 dist-ssr
 *.local
 
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Bot data (contains user info)
+bot/data/users.json
+bot/data/wallets.json
+bot/data/settings.json
+bot/data/positions.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

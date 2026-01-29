@@ -24,6 +24,12 @@ if (!BOT_TOKEN) {
 const bot = new Telegraf(BOT_TOKEN);
 const connection = new Connection(SOLANA_RPC, 'confirmed');
 
+// DEBUG: Log ALL incoming updates at the middleware level
+bot.use((ctx, next) => {
+  console.log(`📩 UPDATE: type=${ctx.updateType}`, ctx.message ? `text="${(ctx.message as any).text}"` : '');
+  return next();
+});
+
 // Data directories
 const dataDir = path.join(__dirname, '../data');
 const USERS_FILE = path.join(dataDir, 'users.json');
@@ -127,8 +133,21 @@ function encryptPrivateKey(privateKey: string): string {
 }
 
 function decryptPrivateKey(encryptedKey: string): string {
-  const bytes = CryptoJS.AES.decrypt(encryptedKey, ENCRYPTION_KEY);
-  return bytes.toString(CryptoJS.enc.Utf8);
+  try {
+    const bytes = CryptoJS.AES.decrypt(encryptedKey, ENCRYPTION_KEY);
+    const decrypted = bytes.toString(CryptoJS.enc.Utf8);
+
+    if (!decrypted || decrypted.length === 0) {
+      console.error('❌ Decryption failed: ENCRYPTION_KEY mismatch');
+      console.error('The wallet was encrypted with a different key than what is currently in .env');
+      return '';
+    }
+
+    return decrypted;
+  } catch (error) {
+    console.error('❌ Decryption error:', error);
+    return '';
+  }
 }
 
 function createWallet(userId: number): { publicKey: string; privateKey: string } {
@@ -150,6 +169,24 @@ function createWallet(userId: number): { publicKey: string; privateKey: string }
 function getUserWallet(userId: number): WalletData | null {
   const wallets = loadWallets();
   return wallets[userId.toString()] || null;
+}
+
+function deleteUserWallet(userId: number): boolean {
+  try {
+    const wallets = loadWallets();
+    const userKey = userId.toString();
+
+    if (wallets[userKey]) {
+      delete wallets[userKey];
+      saveWallets(wallets);
+      console.log(`🗑️ Deleted wallet for user ${userId}`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Error deleting wallet:', error);
+    return false;
+  }
 }
 
 function getKeypairFromWallet(userId: number): Keypair | null {
@@ -392,6 +429,8 @@ Your new Solana wallet:
 
 <code>${publicKey}</code>
 
+<i>Tap the address to copy.</i>
+
 Type /wallet to manage your wallet.
 
 <i>You will be notified when Orvex detects a coin to snipe.</i>`
@@ -517,13 +556,15 @@ bot.action('wallet_menu', async (ctx) => {
 <b>Address:</b>
 <code>${wallet.publicKey}</code>
 
+<i>Tap the address to copy.</i>
+
 <b>Balance:</b> <code>${balance.toFixed(4)} SOL</code>
 
 Select an option:`,
       Markup.inlineKeyboard([
         [Markup.button.callback('📥 Deposit', 'wallet_deposit'), Markup.button.callback('📤 Withdraw', 'wallet_withdraw')],
         [Markup.button.callback('🔑 Export Key', 'wallet_export'), Markup.button.callback('⚙️ Settings', 'trading_settings')],
-        [Markup.button.callback('🔄 Refresh', 'wallet_menu')]
+        [Markup.button.callback('🔄 Refresh', 'wallet_menu'), Markup.button.callback('🗑️ Delete', 'wallet_delete_warning')]
       ])
     );
   } catch (error) {
@@ -634,9 +675,32 @@ bot.action('wallet_export_confirm', async (ctx) => {
     await ctx.answerCbQuery();
 
     const wallet = getUserWallet(ctx.from.id);
-    if (!wallet) return;
+    if (!wallet) {
+      console.log('❌ No wallet found for user', ctx.from.id);
+      return;
+    }
 
+    console.log('🔐 Encrypted key:', wallet.encryptedPrivateKey.substring(0, 50) + '...');
     const privateKey = decryptPrivateKey(wallet.encryptedPrivateKey);
+    console.log('🔓 Decrypted key length:', privateKey.length);
+    console.log('🔓 Decrypted key (first 10 chars):', privateKey.substring(0, 10));
+
+    if (!privateKey || privateKey.length === 0) {
+      await ctx.replyWithHTML(
+        `❌ <b>Error: Could not decrypt private key</b>
+
+This happens when the encryption key has changed since the wallet was created.
+
+<b>Options:</b>
+• Delete this wallet and create a new one
+• Contact support for recovery`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('🗑️ Delete Wallet', 'wallet_delete_confirm')],
+          [Markup.button.callback('← Back', 'wallet_menu')]
+        ])
+      );
+      return;
+    }
 
     const msg = await ctx.replyWithHTML(
       `<b>🔑 PRIVATE KEY</b>
@@ -668,6 +732,69 @@ bot.action('delete_key_message', async (ctx) => {
     await ctx.deleteMessage();
   } catch (error) {
     console.error('Error deleting message:', error);
+  }
+});
+
+// Delete wallet - warning
+bot.action('wallet_delete_warning', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+
+    await ctx.replyWithHTML(
+      `<b>🗑️ DELETE WALLET</b>
+
+<b>⚠️ WARNING</b>
+
+This will permanently delete your wallet from Orvex.
+
+<b>Before deleting:</b>
+◉ Make sure you've exported your private key
+◉ Withdraw all funds from the wallet
+◉ You can create a new wallet afterward
+
+<b>This action cannot be undone.</b>`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('⚠️ Delete Wallet', 'wallet_delete_confirm')],
+        [Markup.button.callback('← Back', 'wallet_menu')]
+      ])
+    );
+  } catch (error) {
+    console.error('Error showing delete warning:', error);
+  }
+});
+
+// Delete wallet - confirm and execute
+bot.action('wallet_delete_confirm', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+
+    const success = deleteUserWallet(ctx.from.id);
+
+    if (success) {
+      await ctx.replyWithHTML(
+        `<b>✓ WALLET DELETED</b>
+
+Your wallet has been removed from Orvex.
+
+Would you like to create a new wallet?`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('⚡ Create New Wallet', 'create_wallet')],
+          [Markup.button.callback('📲 Import Wallet', 'import_wallet')]
+        ])
+      );
+    } else {
+      await ctx.replyWithHTML(
+        `<b>❌ ERROR</b>
+
+Failed to delete wallet. Please try again or contact support.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('← Back', 'wallet_menu')]
+        ])
+      );
+    }
+  } catch (error) {
+    console.error('Error deleting wallet:', error);
+    await ctx.reply('Error deleting wallet. Please try again.');
   }
 });
 
@@ -1226,7 +1353,12 @@ bot.action('cancel_trade', async (ctx) => {
 });
 
 // Handle text messages for custom amounts and wallet import
-bot.on('text', async (ctx) => {
+bot.on('text', async (ctx, next) => {
+  // Skip commands - let command handlers handle them
+  if (ctx.message.text.startsWith('/')) {
+    return next();
+  }
+
   // Check if user is importing a wallet
   const pendingImports = (global as any).pendingImports || {};
   if (pendingImports[ctx.from.id]) {
@@ -1264,6 +1396,8 @@ Please try again with a valid Solana private key.`,
 Your wallet has been imported successfully:
 
 <code>${result.publicKey}</code>
+
+<i>Tap the address to copy.</i>
 
 Type /wallet to manage your wallet.
 
@@ -1423,6 +1557,8 @@ bot.command('withdraw', async (ctx) => {
 
 // /wallet command
 bot.command('wallet', async (ctx) => {
+  console.log(`📥 Received /wallet command from user ${ctx.from.id}`);
+
   const wallet = getUserWallet(ctx.from.id);
   if (!wallet) {
     await ctx.replyWithHTML(
@@ -1443,11 +1579,13 @@ bot.command('wallet', async (ctx) => {
 <b>Address:</b>
 <code>${wallet.publicKey}</code>
 
+<i>Tap the address to copy.</i>
+
 <b>Balance:</b> <code>${balance.toFixed(4)} SOL</code>`,
     Markup.inlineKeyboard([
       [Markup.button.callback('📥 Deposit', 'wallet_deposit'), Markup.button.callback('📤 Withdraw', 'wallet_withdraw')],
       [Markup.button.callback('🔑 Export Key', 'wallet_export'), Markup.button.callback('⚙️ Settings', 'trading_settings')],
-      [Markup.button.callback('🔄 Refresh', 'wallet_menu')]
+      [Markup.button.callback('🔄 Refresh', 'wallet_menu'), Markup.button.callback('🗑️ Delete', 'wallet_delete_warning')]
     ])
   );
 });
@@ -1539,13 +1677,13 @@ bot.catch((err, ctx) => {
 });
 
 // Launch bot
-bot.launch()
-  .then(() => {
-    console.log('Orvex Bot is running...');
-  })
-  .catch((err) => {
-    console.error('Failed to launch bot:', err);
-  });
+console.log('🚀 Starting Orvex Bot...');
+console.log('BOT_TOKEN present:', !!BOT_TOKEN);
+
+// Start polling directly
+bot.launch();
+console.log('✅ Bot is now polling for messages!');
+console.log('📱 Send /wallet to @OrvexAI_bot');
 
 // Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
